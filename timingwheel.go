@@ -28,7 +28,7 @@ type TimingWheel struct {
 	waitGroup waitGroupWrapper
 }
 
-// NewTimingWheel creates an instance of TimingWheel with the given tick and wheelSize.
+// NewTimingWheel 创建并初始化一个新的时间轮实例
 func NewTimingWheel(tick time.Duration, wheelSize int64) *TimingWheel {
 	tickMs := int64(tick / time.Millisecond)
 	if tickMs <= 0 {
@@ -45,7 +45,7 @@ func NewTimingWheel(tick time.Duration, wheelSize int64) *TimingWheel {
 	)
 }
 
-// newTimingWheel is an internal helper function that really creates an instance of TimingWheel.
+// 初始化时间轮的各个字段，并创建每个 bucket
 func newTimingWheel(tickMs int64, wheelSize int64, startMs int64, queue *delayqueue.DelayQueue) *TimingWheel {
 	buckets := make([]*bucket, wheelSize)
 	for i := range buckets {
@@ -62,32 +62,22 @@ func newTimingWheel(tickMs int64, wheelSize int64, startMs int64, queue *delayqu
 	}
 }
 
-// add inserts the timer t into the current timing wheel.
+// add 方法将定时器添加到当前时间轮或更高级的时间轮中
 func (tw *TimingWheel) add(t *Timer) bool {
 	currentTime := atomic.LoadInt64(&tw.currentTime)
-	if t.expiration < currentTime+tw.tick {
-		// Already expired
+
+	if t.expiration < currentTime+tw.tick { // 如果定时器已经过期，返回 false
 		return false
-	} else if t.expiration < currentTime+tw.interval {
-		// Put it into its own bucket
+	} else if t.expiration < currentTime+tw.interval { // 如果定时器的到期时间在当前时间轮的时间范围内，将其添加到相应的 bucket
 		virtualID := t.expiration / tw.tick
 		b := tw.buckets[virtualID%tw.wheelSize]
 		b.Add(t)
-
-		// Set the bucket expiration time
 		if b.SetExpiration(virtualID * tw.tick) {
-			// The bucket needs to be enqueued since it was an expired bucket.
-			// We only need to enqueue the bucket when its expiration time has changed,
-			// i.e. the wheel has advanced and this bucket get reused with a new expiration.
-			// Any further calls to set the expiration within the same wheel cycle will
-			// pass in the same value and hence return false, thus the bucket with the
-			// same expiration will not be enqueued multiple times.
 			tw.queue.Offer(b, b.Expiration())
 		}
 
 		return true
-	} else {
-		// Out of the interval. Put it into the overflow wheel
+	} else { // 如果定时器的到期时间超出了当前时间轮的时间范围，将其添加到更高级的时间轮中
 		overflowWheel := atomic.LoadPointer(&tw.overflowWheel)
 		if overflowWheel == nil {
 			atomic.CompareAndSwapPointer(
@@ -106,18 +96,14 @@ func (tw *TimingWheel) add(t *Timer) bool {
 	}
 }
 
-// addOrRun inserts the timer t into the current timing wheel, or run the
-// timer's task if it has already expired.
+// 尝试将定时器添加到时间轮中，如果定时器已经过期，直接执行定时任务
 func (tw *TimingWheel) addOrRun(t *Timer) {
 	if !tw.add(t) {
-		// Already expired
-
-		// Like the standard time.AfterFunc (https://golang.org/pkg/time/#AfterFunc),
-		// always execute the timer's task in its own goroutine.
 		go t.task()
 	}
 }
 
+// 推进时间轮的时间，并尝试推进更高级时间轮的时间
 func (tw *TimingWheel) advanceClock(expiration int64) {
 	currentTime := atomic.LoadInt64(&tw.currentTime)
 	if expiration >= currentTime+tw.tick {
@@ -132,14 +118,15 @@ func (tw *TimingWheel) advanceClock(expiration int64) {
 	}
 }
 
-// Start starts the current timing wheel.
+// 启动时间轮
 func (tw *TimingWheel) Start() {
+	// 轮询延迟队列
 	tw.waitGroup.Wrap(func() {
 		tw.queue.Poll(tw.exitC, func() int64 {
 			return timeToMs(time.Now().UTC())
 		})
 	})
-
+	// 处理到期的桶
 	tw.waitGroup.Wrap(func() {
 		for {
 			select {
@@ -154,18 +141,13 @@ func (tw *TimingWheel) Start() {
 	})
 }
 
-// Stop stops the current timing wheel.
-//
-// If there is any timer's task being running in its own goroutine, Stop does
-// not wait for the task to complete before returning. If the caller needs to
-// know whether the task is completed, it must coordinate with the task explicitly.
+// 停止时间轮，关闭 exitC 通道并等待所有 goroutine 退出
 func (tw *TimingWheel) Stop() {
 	close(tw.exitC)
 	tw.waitGroup.Wait()
 }
 
-// AfterFunc waits for the duration to elapse and then calls f in its own goroutine.
-// It returns a Timer that can be used to cancel the call using its Stop method.
+// 等待指定的持续时间后调用函数 f，并返回一个定时器
 func (tw *TimingWheel) AfterFunc(d time.Duration, f func()) *Timer {
 	t := &Timer{
 		expiration: timeToMs(time.Now().UTC().Add(d)),
@@ -175,52 +157,27 @@ func (tw *TimingWheel) AfterFunc(d time.Duration, f func()) *Timer {
 	return t
 }
 
-// Scheduler determines the execution plan of a task.
 type Scheduler interface {
-	// Next returns the next execution time after the given (previous) time.
-	// It will return a zero time if no next time is scheduled.
-	//
-	// All times must be UTC.
 	Next(time.Time) time.Time
 }
 
-// ScheduleFunc calls f (in its own goroutine) according to the execution
-// plan scheduled by s. It returns a Timer that can be used to cancel the
-// call using its Stop method.
-//
-// If the caller want to terminate the execution plan halfway, it must
-// stop the timer and ensure that the timer is stopped actually, since in
-// the current implementation, there is a gap between the expiring and the
-// restarting of the timer. The wait time for ensuring is short since the
-// gap is very small.
-//
-// Internally, ScheduleFunc will ask the first execution time (by calling
-// s.Next()) initially, and create a timer if the execution time is non-zero.
-// Afterwards, it will ask the next execution time each time f is about to
-// be executed, and f will be called at the next execution time if the time
-// is non-zero.
+// 根据调度器 s 的计划调用函数 f，并返回一个定时器
 func (tw *TimingWheel) ScheduleFunc(s Scheduler, f func()) (t *Timer) {
 	expiration := s.Next(time.Now().UTC())
 	if expiration.IsZero() {
-		// No time is scheduled, return nil.
 		return
 	}
-
 	t = &Timer{
 		expiration: timeToMs(expiration),
 		task: func() {
-			// Schedule the task to execute at the next time if possible.
 			expiration := s.Next(msToTime(t.expiration))
 			if !expiration.IsZero() {
 				t.expiration = timeToMs(expiration)
 				tw.addOrRun(t)
 			}
-
-			// Actually execute the task.
 			f()
 		},
 	}
 	tw.addOrRun(t)
-
 	return
 }

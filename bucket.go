@@ -7,64 +7,45 @@ import (
 	"unsafe"
 )
 
-// Timer represents a single event. When the Timer expires, the given
-// task will be executed.
+// Timer 代表单个事件。当 Timer 到期时，将执行给定的任务
 type Timer struct {
-	expiration int64 // in milliseconds
-	task       func()
+	expiration int64  // 到期时间（以毫秒为单位）
+	task       func() // 定时任务
 
-	// The bucket that holds the list to which this timer's element belongs.
-	//
-	// NOTE: This field may be updated and read concurrently,
-	// through Timer.Stop() and Bucket.Flush().
-	b unsafe.Pointer // type: *bucket
+	// 指向包含该定时器的 bucket
+	b unsafe.Pointer // 类型：*bucket
 
-	// The timer's element.
+	// 定时器在双向链表中的元素
 	element *list.Element
 }
 
+// 获取当前定时器所属的 bucket
 func (t *Timer) getBucket() *bucket {
 	return (*bucket)(atomic.LoadPointer(&t.b))
 }
 
+// 设置当前定时器所属的 bucket
 func (t *Timer) setBucket(b *bucket) {
 	atomic.StorePointer(&t.b, unsafe.Pointer(b))
 }
 
-// Stop prevents the Timer from firing. It returns true if the call
-// stops the timer, false if the timer has already expired or been stopped.
-//
-// If the timer t has already expired and the t.task has been started in its own
-// goroutine; Stop does not wait for t.task to complete before returning. If the caller
-// needs to know whether t.task is completed, it must coordinate with t.task explicitly.
+// 停止定时器，如果定时器已过期或已停止，返回 false, 否则返回 true
+// 通过不断重试获取和移除定时器所属的 bucket，确保定时器被正确移除
 func (t *Timer) Stop() bool {
 	stopped := false
 	for b := t.getBucket(); b != nil; b = t.getBucket() {
-		// If b.Remove is called just after the timing wheel's goroutine has:
-		//     1. removed t from b (through b.Flush -> b.remove)
-		//     2. moved t from b to another bucket ab (through b.Flush -> b.remove and ab.Add)
-		// this may fail to remove t due to the change of t's bucket.
 		stopped = b.Remove(t)
-
-		// Thus, here we re-get t's possibly new bucket (nil for case 1, or ab (non-nil) for case 2),
-		// and retry until the bucket becomes nil, which indicates that t has finally been removed.
 	}
 	return stopped
 }
 
 type bucket struct {
-	// 64-bit atomic operations require 64-bit alignment, but 32-bit
-	// compilers do not ensure it. So we must keep the 64-bit field
-	// as the first field of the struct.
-	//
-	// For more explanations, see https://golang.org/pkg/sync/atomic/#pkg-note-BUG
-	// and https://go101.org/article/memory-layout.html.
-	expiration int64
-
-	mu     sync.Mutex
-	timers *list.List
+	expiration int64      // 桶的过期时间
+	mu         sync.Mutex // 互斥锁，保护定时器链表的并发访问
+	timers     *list.List // 包含的定时器的双向链表
 }
 
+// 创建一个新的 bucket
 func newBucket() *bucket {
 	return &bucket{
 		timers:     list.New(),
@@ -72,17 +53,19 @@ func newBucket() *bucket {
 	}
 }
 
+// 获取桶的过期时间
 func (b *bucket) Expiration() int64 {
 	return atomic.LoadInt64(&b.expiration)
 }
 
+// 设置桶的过期时间，返回是否成功更新
 func (b *bucket) SetExpiration(expiration int64) bool {
 	return atomic.SwapInt64(&b.expiration, expiration) != expiration
 }
 
+// 向桶中添加定时器
 func (b *bucket) Add(t *Timer) {
 	b.mu.Lock()
-
 	e := b.timers.PushBack(t)
 	t.setBucket(b)
 	t.element = e
@@ -90,13 +73,9 @@ func (b *bucket) Add(t *Timer) {
 	b.mu.Unlock()
 }
 
+// 从桶中移除定时器，返回是否成功移除
 func (b *bucket) remove(t *Timer) bool {
 	if t.getBucket() != b {
-		// If remove is called from within t.Stop, and this happens just after the timing wheel's goroutine has:
-		//     1. removed t from b (through b.Flush -> b.remove)
-		//     2. moved t from b to another bucket ab (through b.Flush -> b.remove and ab.Add)
-		// then t.getBucket will return nil for case 1, or ab (non-nil) for case 2.
-		// In either case, the returned value does not equal to b.
 		return false
 	}
 	b.timers.Remove(t.element)
@@ -105,29 +84,23 @@ func (b *bucket) remove(t *Timer) bool {
 	return true
 }
 
+// 安全地从桶中移除定时器
 func (b *bucket) Remove(t *Timer) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.remove(t)
 }
 
+// 刷新桶中的定时器，将它们重新插入到新的桶中或执行它们
 func (b *bucket) Flush(reinsert func(*Timer)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	for e := b.timers.Front(); e != nil; {
 		next := e.Next()
-
 		t := e.Value.(*Timer)
 		b.remove(t)
-		// Note that this operation will either execute the timer's task, or
-		// insert the timer into another bucket belonging to a lower-level wheel.
-		//
-		// In either case, no further lock operation will happen to b.mu.
 		reinsert(t)
-
 		e = next
 	}
-
 	b.SetExpiration(-1)
 }

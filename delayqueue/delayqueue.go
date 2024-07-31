@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// The start of PriorityQueue implementation.
-// Borrowed from https://github.com/nsqio/nsq/blob/master/internal/pqueue/pqueue.go
+// 优先队列的实现
+// 参考 https://github.com/nsqio/nsq/blob/master/internal/pqueue/pqueue.go
 
 type item struct {
 	Value    interface{}
@@ -16,28 +16,32 @@ type item struct {
 	Index    int
 }
 
-// this is a priority queue as implemented by a min heap
-// ie. the 0th element is the *lowest* value
+// 最小堆实现的优先队列，优先级最小的元素在队列的顶部（第 0 位的值为最小值），每次移除元素时总是移除优先级最高（或最低）的元素
 type priorityQueue []*item
 
+// 创建一个初始容量为 capacity 的优先队列
 func newPriorityQueue(capacity int) priorityQueue {
 	return make(priorityQueue, 0, capacity)
 }
 
+// 返回优先队列的长度
 func (pq priorityQueue) Len() int {
 	return len(pq)
 }
 
+// 比较两个元素的优先级，返回 true 如果 pq[i] 的优先级小于 pq[j]
 func (pq priorityQueue) Less(i, j int) bool {
 	return pq[i].Priority < pq[j].Priority
 }
 
+// 交换优先队列中两个元素的位置，并更新它们的索引
 func (pq priorityQueue) Swap(i, j int) {
 	pq[i], pq[j] = pq[j], pq[i]
 	pq[i].Index = i
 	pq[j].Index = j
 }
 
+// 向优先队列中添加一个新元素。如果容量不足，则扩展容量
 func (pq *priorityQueue) Push(x interface{}) {
 	n := len(*pq)
 	c := cap(*pq)
@@ -52,6 +56,7 @@ func (pq *priorityQueue) Push(x interface{}) {
 	(*pq)[n] = item
 }
 
+// 从优先队列中移除并返回优先级最高的元素。如果队列的长度小于容量的一半且容量大于25，则缩小容量
 func (pq *priorityQueue) Pop() interface{} {
 	n := len(*pq)
 	c := cap(*pq)
@@ -66,6 +71,7 @@ func (pq *priorityQueue) Pop() interface{} {
 	return item
 }
 
+// 查看队列中优先级最高的元素。如果其优先级小于等于 max，则移除该元素并返回；否则返回该元素的优先级与 max 的差值
 func (pq *priorityQueue) PeekAndShift(max int64) (*item, int64) {
 	if pq.Len() == 0 {
 		return nil, 0
@@ -80,23 +86,18 @@ func (pq *priorityQueue) PeekAndShift(max int64) (*item, int64) {
 	return item, 0
 }
 
-// The end of PriorityQueue implementation.
-
-// DelayQueue is an unbounded blocking queue of *Delayed* elements, in which
-// an element can only be taken when its delay has expired. The head of the
-// queue is the *Delayed* element whose delay expired furthest in the past.
+// 实现了一个基于优先队列的延迟队列（DelayQueue），其中元素只有在其延迟时间到期后才能被取出。队列的头部总是延迟时间最早过期的元素
 type DelayQueue struct {
-	C chan interface{}
+	C  chan interface{} // 用于输出到期元素的通道
+	mu sync.Mutex       // 互斥锁，用于保护优先队列的并发访问
+	pq priorityQueue    // 优先队列，用于存储带有延迟时间的元素
 
-	mu sync.Mutex
-	pq priorityQueue
-
-	// Similar to the sleeping state of runtime.timers.
-	sleeping int32
-	wakeupC  chan struct{}
+	// 类似于 runtime.timers 的睡眠状态
+	sleeping int32         // 表示队列是否处于睡眠状态
+	wakeupC  chan struct{} // 用于唤醒 Poll 循环的通道
 }
 
-// New creates an instance of delayQueue with the specified size.
+// 创建一个指定大小的延迟队列实例
 func New(size int) *DelayQueue {
 	return &DelayQueue{
 		C:       make(chan interface{}),
@@ -105,7 +106,9 @@ func New(size int) *DelayQueue {
 	}
 }
 
-// Offer inserts the element into the current queue.
+// 向延迟队列中插入一个新的元素
+// 首先创建一个新的 item，然后加锁将该元素插入优先队列
+// 如果新插入的元素是队列中延迟时间最早的元素（索引为0），且队列处于睡眠状态，则通过 wakeupC 通道唤醒 Poll 循环
 func (dq *DelayQueue) Offer(elem interface{}, expiration int64) {
 	item := &item{Value: elem, Priority: expiration}
 
@@ -115,15 +118,16 @@ func (dq *DelayQueue) Offer(elem interface{}, expiration int64) {
 	dq.mu.Unlock()
 
 	if index == 0 {
-		// A new item with the earliest expiration is added.
+		// 如果新插入的元素是队列中延迟时间最早的元素
 		if atomic.CompareAndSwapInt32(&dq.sleeping, 1, 0) {
 			dq.wakeupC <- struct{}{}
 		}
 	}
 }
 
-// Poll starts an infinite loop, in which it continually waits for an element
-// to expire and then send the expired element to the channel C.
+// 启动一个无限循环，不断等待元素到期并将到期的元素发送到通道 C
+// 在每次循环中，首先获取当前时间 now，然后尝试从优先队列中取出到期的元素
+// 如果没有到期的元素，则设置队列为睡眠状态并等待唤醒或超时。如果有到期的元素，则将其发送到通道 C
 func (dq *DelayQueue) Poll(exitC chan struct{}, nowF func() int64) {
 	for {
 		now := nowF()
@@ -131,38 +135,37 @@ func (dq *DelayQueue) Poll(exitC chan struct{}, nowF func() int64) {
 		dq.mu.Lock()
 		item, delta := dq.pq.PeekAndShift(now)
 		if item == nil {
-			// No items left or at least one item is pending.
+			// 没有元素或至少有一个元素未到期
 
-			// We must ensure the atomicity of the whole operation, which is
-			// composed of the above PeekAndShift and the following StoreInt32,
-			// to avoid possible race conditions between Offer and Poll.
+			// 我们必须保证整个操作的原子性，即
+			// 由上面的 PeekAndShift 和下面的 StoreInt32 组成，
+			// 以避免 Offer 和 Poll 之间可能出现的竞争条件。
 			atomic.StoreInt32(&dq.sleeping, 1)
 		}
 		dq.mu.Unlock()
 
 		if item == nil {
 			if delta == 0 {
-				// No items left.
+				// 没有剩余的元素
 				select {
 				case <-dq.wakeupC:
-					// Wait until a new item is added.
+					// 等待，直到添加新项目
 					continue
 				case <-exitC:
 					goto exit
 				}
 			} else if delta > 0 {
-				// At least one item is pending.
+				// 至少有一个元素未到期
 				select {
 				case <-dq.wakeupC:
-					// A new item with an "earlier" expiration than the current "earliest" one is added.
+					// 添加一个比当前最早到期时间更早的新项目。
 					continue
 				case <-time.After(time.Duration(delta) * time.Millisecond):
-					// The current "earliest" item expires.
-
-					// Reset the sleeping state since there's no need to receive from wakeupC.
+					// 当前最早项目已过期。
+					// 重置睡眠状态，因为无需从 wakeupC 接收
 					if atomic.SwapInt32(&dq.sleeping, 0) == 0 {
-						// A caller of Offer() is being blocked on sending to wakeupC,
-						// drain wakeupC to unblock the caller.
+						// Offer() 的调用者在向 wakeupC 发送消息时被阻塞
+						// 耗尽 wakeupC 以解除调用者的阻塞
 						<-dq.wakeupC
 					}
 					continue
@@ -174,13 +177,13 @@ func (dq *DelayQueue) Poll(exitC chan struct{}, nowF func() int64) {
 
 		select {
 		case dq.C <- item.Value:
-			// The expired element has been sent out successfully.
+			// 过期元素已成功发送出去
 		case <-exitC:
 			goto exit
 		}
 	}
 
 exit:
-	// Reset the states
+	// 重置状态
 	atomic.StoreInt32(&dq.sleeping, 0)
 }

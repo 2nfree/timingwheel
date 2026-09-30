@@ -7,7 +7,7 @@ import (
 	"unsafe"
 )
 
-// Timer 代表单个事件。当 Timer 到期时，将执行给定的任务
+// Timer 代表单个事件，当 Timer 到期时，将执行给定的任务
 type Timer struct {
 	expiration int64  // 到期时间（以毫秒为单位）
 	task       func() // 定时任务

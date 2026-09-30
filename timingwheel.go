@@ -2,30 +2,26 @@ package timingwheel
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
-
-	"github.com/RussellLuo/timingwheel/delayqueue"
 )
 
-// TimingWheel is an implementation of Hierarchical Timing Wheels.
+// TimingWheel 时间轮
 type TimingWheel struct {
-	tick      int64 // in milliseconds
-	wheelSize int64
+	tick      int64 // 时间轮的刻度，以毫秒为单位
+	wheelSize int64 // 时间轮的槽数
 
-	interval    int64 // in milliseconds
-	currentTime int64 // in milliseconds
+	interval    int64 // 时间轮的总时间跨度，以毫秒为单位
+	currentTime int64 // 当前时间，以毫秒为单位
 	buckets     []*bucket
-	queue       *delayqueue.DelayQueue
+	queue       *DelayQueue
 
-	// The higher-level overflow wheel.
-	//
-	// NOTE: This field may be updated and read concurrently, through Add().
-	overflowWheel unsafe.Pointer // type: *TimingWheel
+	overflowWheel unsafe.Pointer // 更高级的时间轮
 
 	exitC     chan struct{}
-	waitGroup waitGroupWrapper
+	waitGroup sync.WaitGroup
 }
 
 // NewTimingWheel 创建并初始化一个新的时间轮实例
@@ -34,19 +30,17 @@ func NewTimingWheel(tick time.Duration, wheelSize int64) *TimingWheel {
 	if tickMs <= 0 {
 		panic(errors.New("tick must be greater than or equal to 1ms"))
 	}
-
-	startMs := timeToMs(time.Now().UTC())
-
+	startMs := time.Now().UnixNano() / int64(time.Millisecond)
 	return newTimingWheel(
 		tickMs,
 		wheelSize,
 		startMs,
-		delayqueue.New(int(wheelSize)),
+		NewDelayQueue(int(wheelSize)),
 	)
 }
 
 // 初始化时间轮的各个字段，并创建每个 bucket
-func newTimingWheel(tickMs int64, wheelSize int64, startMs int64, queue *delayqueue.DelayQueue) *TimingWheel {
+func newTimingWheel(tickMs int64, wheelSize int64, startMs int64, queue *DelayQueue) *TimingWheel {
 	buckets := make([]*bucket, wheelSize)
 	for i := range buckets {
 		buckets[i] = newBucket()
@@ -109,8 +103,6 @@ func (tw *TimingWheel) advanceClock(expiration int64) {
 	if expiration >= currentTime+tw.tick {
 		currentTime = truncate(expiration, tw.tick)
 		atomic.StoreInt64(&tw.currentTime, currentTime)
-
-		// Try to advance the clock of the overflow wheel if present
 		overflowWheel := atomic.LoadPointer(&tw.overflowWheel)
 		if overflowWheel != nil {
 			(*TimingWheel)(overflowWheel).advanceClock(currentTime)
@@ -121,13 +113,17 @@ func (tw *TimingWheel) advanceClock(expiration int64) {
 // 启动时间轮
 func (tw *TimingWheel) Start() {
 	// 轮询延迟队列
-	tw.waitGroup.Wrap(func() {
+	tw.waitGroup.Add(1)
+	go func() {
+		defer tw.waitGroup.Done()
 		tw.queue.Poll(tw.exitC, func() int64 {
-			return timeToMs(time.Now().UTC())
+			return time.Now().UnixNano() / int64(time.Millisecond)
 		})
-	})
+	}()
 	// 处理到期的桶
-	tw.waitGroup.Wrap(func() {
+	tw.waitGroup.Add(1)
+	go func() {
+		defer tw.waitGroup.Done()
 		for {
 			select {
 			case elem := <-tw.queue.C:
@@ -138,7 +134,7 @@ func (tw *TimingWheel) Start() {
 				return
 			}
 		}
-	})
+	}()
 }
 
 // 停止时间轮，关闭 exitC 通道并等待所有 goroutine 退出
@@ -150,29 +146,30 @@ func (tw *TimingWheel) Stop() {
 // 等待指定的持续时间后调用函数 f，并返回一个定时器
 func (tw *TimingWheel) AfterFunc(d time.Duration, f func()) *Timer {
 	t := &Timer{
-		expiration: timeToMs(time.Now().UTC().Add(d)),
+		expiration: time.Now().Add(d).UnixNano() / int64(time.Millisecond),
 		task:       f,
 	}
 	tw.addOrRun(t)
 	return t
 }
 
+// Scheduler 定时调度器接口
 type Scheduler interface {
 	Next(time.Time) time.Time
 }
 
 // 根据调度器 s 的计划调用函数 f，并返回一个定时器
 func (tw *TimingWheel) ScheduleFunc(s Scheduler, f func()) (t *Timer) {
-	expiration := s.Next(time.Now().UTC())
+	expiration := s.Next(time.Now())
 	if expiration.IsZero() {
 		return
 	}
 	t = &Timer{
-		expiration: timeToMs(expiration),
+		expiration: expiration.UnixNano() / int64(time.Millisecond),
 		task: func() {
-			expiration := s.Next(msToTime(t.expiration))
+			expiration := s.Next(time.Unix(0, t.expiration*int64(time.Millisecond)))
 			if !expiration.IsZero() {
-				t.expiration = timeToMs(expiration)
+				t.expiration = expiration.UnixNano() / int64(time.Millisecond)
 				tw.addOrRun(t)
 			}
 			f()
@@ -180,4 +177,12 @@ func (tw *TimingWheel) ScheduleFunc(s Scheduler, f func()) (t *Timer) {
 	}
 	tw.addOrRun(t)
 	return
+}
+
+// 返回将 x 向零方向舍入为 m 的倍数的结果, 如果 m <= 0，则返回未改变的 x
+func truncate(x, m int64) int64 {
+	if m <= 0 {
+		return x
+	}
+	return x - x%m
 }
